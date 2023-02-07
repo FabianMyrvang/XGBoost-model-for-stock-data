@@ -1,0 +1,275 @@
+---
+title: "XGBoost for Stock data"
+author: "Fabian"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE}
+library(dplyr)
+library(tidymodels)
+library(rpart)  # For decision trees
+library(rpart.plot) 
+library(xgboost)
+library(caret)
+library(lubridate)
+library(doParallel)
+library(tictoc)
+library(themis)
+library(rsample)
+library(recipes)
+library(parsnip)
+library(vip)
+
+```
+
+Loading in data consisting of monthly crsp and compustat data dating back to 2011.
+The initial data has 633 889 observations. By removing NAs the data is reduced to 
+64 988 observations across 71 different variables.
+
+The goal is to try predicting stocks that are 7 times more volatile than the 
+index. 
+```{r}
+crsp_compustat <- readRDS("merged_cleaned.Rdata")
+
+merged_cleaned_na_omit <- crsp_compustat %>% 
+  mutate(month = as.factor(month(date))) %>% 
+  na.omit() %>% 
+  arrange(date)
+
+head(merged_cleaned_na_omit)
+```
+
+```{r}
+count <- table(merged_cleaned_na_omit$volatility_level)
+count
+
+prop.table(count)
+```
+
+
+Splitting the data into train and test set. The train set dates from 2011 to 
+the end of 2017. The test set is from 2018 - 2019.
+```{r}
+# Filtering out 2020
+merged_clean_modelling <-
+  filter(merged_cleaned_na_omit[year(merged_cleaned_na_omit$date) != 2020, ])
+
+#create train and test set
+XGBsplit <- initial_time_split(merged_clean_modelling, 
+                               prop = min(which(year(merged_clean_modelling$date) == 2018)-1)/nrow(merged_clean_modelling))
+XGBtrain <- training(XGBsplit)
+XGBtest <- testing(XGBsplit)
+
+```
+
+The model recipe for one hot encoding categorical variables.
+```{r}
+# Model recipe for one hot encoding and normalazing data
+models_recipe <- 
+  recipe(volatility_level ~ ., data = XGBtrain) %>% # Variables and training dataset
+  step_normalize(all_numeric()) %>% # Normalize variables
+  step_dummy(all_nominal_predictors()) %>% #Convert all factor variable to dummies
+  step_rm(permno) %>% 
+  update_role(date, new_role = "dont use")
+
+XGBtest_prepped <- prep(models_recipe) %>% 
+  bake(new_data = XGBtest)
+
+XGBtrain_prepped <- prep(models_recipe) %>% 
+  juice()
+
+```
+
+Now on to building the model:
+```{r}
+
+# Model tuning
+set.seed(123)
+xgb_spec <- boost_tree(
+  trees = 100,          
+  tree_depth = tune(), min_n = tune(), 
+  loss_reduction = tune(),                     ## first three: model complexity
+  sample_size = tune(), mtry = tune(),         ## randomness
+  learn_rate = tune(),                         ## step size
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+?set_mode
+
+
+# XGB grid tuning
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), XGBtrain),
+  learn_rate(),
+  size = 20
+)
+
+xgb_grid
+
+#Xgb workflow
+xgb_wf <- workflow() %>%
+  add_recipe(models_recipe) %>% 
+  add_model(xgb_spec) 
+
+xgb_wf
+```
+
+The sliding window cross validation sets is to prevent data leakage so that
+validation folds are not set randomly, but in a continuous time interval.
+```{r}
+# Cross validation set
+xgb_folds <-
+  sliding_window(XGBtrain %>% arrange(date),
+                 lookback = 10000, # Use 10000 observations for training
+                 assess_stop = 4000, # Use 4000 observations for testing
+                 step = 5000) # Steps of 4500 for partial overlap between train and validation
+
+```
+
+A ggplot of the cross validation sets:
+```{r}
+ggplot(xgb_folds %>% tidy(), 
+       aes(x = Resample, y = Row, fill = Data)) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.y = element_blank(),
+        legend.title = element_blank()) +
+  geom_tile() +
+  coord_flip() +
+  scale_fill_discrete(labels = c("Training (10000 obs)", "Cross-Validation (4000 obs)")) +
+  xlab("Folds\n") +
+  ylab("\nObservations")
+```
+
+```{r}
+Cores <- detectCores() -1
+
+# Instantiate the cores:
+cl <- makeCluster(Cores)
+
+# Next we register the cluster..
+registerDoParallel(cl)
+
+tic(paste0("Parallel, ", Cores, " cores"))
+
+set.seed(234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = xgb_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+# Closing off Clusters
+stopCluster(cl)
+
+toc(log = TRUE)
+
+
+xgb_res
+
+collect_metrics(xgb_res)
+
+```
+
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+
+```
+
+```{r}
+show_best(xgb_res, "roc_auc")
+
+# Selecting the best AUC
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+
+```
+
+```{r}
+# Finalizing the workflow
+final_xgb <- finalize_workflow(
+  xgb_wf,
+  best_auc
+)
+final_xgb
+```
+
+Variable importance plot:
+```{r}
+final_xgb %>%
+  fit(data = XGBtest) %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 15L,
+      geom = "col")
+```
+
+
+```{r}
+unregister_dopar <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list=ls(name=env), pos=env)
+}
+unregister_dopar()
+
+
+# Fitting on test data
+final_res <- last_fit(final_xgb, XGBsplit)
+
+# Collecting metrics
+collect_metrics(final_res)
+
+# Making the roc curve 
+final_res %>% 
+  collect_predictions() %>% 
+  roc_curve(volatility_level, .pred_0) %>% 
+  autoplot()
+
+final_res
+
+# Fitting the model on the train data
+xgb_fit <- fit(final_xgb, XGBtrain)
+
+# Predicting on the test data
+xgb_pred <- predict(xgb_fit, XGBtest)
+
+xgb_pred
+
+# Unlisting the xgb_pred
+xgb_pred <- unlist(xgb_pred)
+
+# Converting it into a dataframe
+xgb_pred <- data.frame(xgb_pred)
+
+xgb_pred$xgb_pred <- as.factor(xgb_pred$xgb_pred)
+
+XGBtest$volatility_level <- as.factor(XGBtest$volatility_level)
+
+# Making the confusion Matrix
+confusionMatrix(xgb_pred$xgb_pred, XGBtest$volatility_level)
+
+```
+
+
+

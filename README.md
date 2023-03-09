@@ -1,1 +1,1 @@
-# XGBoost-model-for-predicting-volatility
+# XGBoost-model-for-predicting-stock-volatility
